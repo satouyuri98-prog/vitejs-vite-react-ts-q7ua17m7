@@ -1,20 +1,27 @@
-import { GoogleGenAI, Type, Modality } from '@google/genai';
-import { SearchResult, NotebookItem } from '../types';
-import { AUDIO_SAMPLE_RATE } from '../constants';
+import { GoogleGenAI, Type, Modality } from "@google/genai";
+import { SearchResult, NotebookItem } from "../types";
+import { AUDIO_SAMPLE_RATE } from "../constants";
 
-// 初始化 AI 客户端
+// --- FIX: 告诉 TypeScript 检查员 process 是存在的 ---
+declare const process: {
+  env: {
+    API_KEY: string;
+  }
+};
+
+// Initialize Gemini Client
+// Note: The API key is injected via vite.config.ts defining process.env.API_KEY
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-// --- 音频系统 (单例模式) ---
+// --- Audio System (Singleton & Caching) ---
 
 let sharedAudioContext: AudioContext | null = null;
 const audioCache = new Map<string, Promise<AudioBuffer>>();
 
 const getAudioContext = () => {
   if (!sharedAudioContext) {
-    sharedAudioContext = new (window.AudioContext ||
-      (window as any).webkitAudioContext)({
-      sampleRate: AUDIO_SAMPLE_RATE,
+    sharedAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
+      sampleRate: AUDIO_SAMPLE_RATE
     });
   }
   return sharedAudioContext;
@@ -34,14 +41,12 @@ async function decodeAudioData(
   data: Uint8Array,
   ctx: AudioContext
 ): Promise<AudioBuffer> {
+  // SAFETY: Ensure data length is even for Int16Array
   if (data.length % 2 !== 0) {
     data = data.subarray(0, data.length - 1);
   }
-  const dataInt16 = new Int16Array(
-    data.buffer,
-    data.byteOffset,
-    data.length / 2
-  );
+
+  const dataInt16 = new Int16Array(data.buffer, data.byteOffset, data.length / 2);
   const frameCount = dataInt16.length;
   const buffer = ctx.createBuffer(1, frameCount, AUDIO_SAMPLE_RATE);
   const channelData = buffer.getChannelData(0);
@@ -51,122 +56,150 @@ async function decodeAudioData(
   return buffer;
 }
 
-// --- 核心功能 ---
+// --- API Functions ---
 
 export const lookupWord = async (
   term: string,
   nativeLang: string,
   targetLang: string
 ): Promise<SearchResult> => {
+  // Optimized for EXTREME SPEED & LOGIC ACCURACY.
   const systemInstruction = `
     You are a strict translator and dictionary API.
-    INPUT: Term "${term}". USER NATIVE: ${nativeLang}. TARGET: ${targetLang}.
     
-    LOGIC:
-    1. If term is not in ${targetLang}, TRANSLATE it to ${targetLang} first. Use that as the HEADWORD.
-    2. Define the HEADWORD in ${nativeLang}.
-    3. PRONUNCIATION: Japanese=Romaji, Chinese=Pinyin, Others=IPA.
-    4. EXAMPLES:
-       - takarazukaExample: Must use Kanji "天海祐希" (Amami Yuki).
-    5. OUTPUT JSON.
+    INPUT: Term "${term}".
+    USER NATIVE LANG: ${nativeLang}.
+    TARGET LANG: ${targetLang}.
+
+    LOGIC STEPS:
+    1. DETECT: Is "${term}" in ${targetLang}? 
+       - YES: Use it as the HEADWORD.
+       - NO: TRANSLATE "${term}" into ${targetLang} to get the HEADWORD.
+    2. DEFINE: Provide the definition of the HEADWORD in ${nativeLang}.
+    3. PRONUNCIATION RULES:
+       - If Target is Japanese: MUST use Standard Romaji (e.g., "konnichiwa").
+       - If Target is Chinese: MUST use Pinyin.
+       - Others: IPA or standard phonetic spelling.
+    4. OUTPUT JSON ONLY.
+
+    CRITICAL OUTPUT RULES:
+    - "word": The HEADWORD in ${targetLang} (e.g., if input "Apple" -> output "りんご").
+    - "pronunciation": See rule #3.
+    - "takarazukaExample": MUST use Kanji "天海祐希" (never Hiragana). Text in ${targetLang}.
+    - "generalExample": Simple sentence in ${targetLang}.
+    - "definition": In ${nativeLang}.
+    - "partOfSpeech": in ${nativeLang} or standard abbr.
   `;
 
   const response = await ai.models.generateContent({
-    model: 'gemini-2.5-flash',
-    contents: `Define: ${term}`,
+    model: 'gemini-2.5-flash', 
+    contents: `Map term: ${term}`, 
     config: {
       systemInstruction: systemInstruction,
-      responseMimeType: 'application/json',
-      thinkingConfig: { thinkingBudget: 0 },
+      responseMimeType: "application/json",
+      thinkingConfig: { thinkingBudget: 0 }, // Maximum speed
       responseSchema: {
         type: Type.OBJECT,
         properties: {
-          word: { type: Type.STRING },
-          pronunciation: { type: Type.STRING },
+          word: { type: Type.STRING, description: `The word in ${targetLang}` },
+          pronunciation: { type: Type.STRING, description: `Romaji for JP, Pinyin for CN, IPA for others` },
           partOfSpeech: { type: Type.STRING },
           definition: { type: Type.STRING },
           takarazukaExample: {
             type: Type.OBJECT,
             properties: {
               text: { type: Type.STRING },
-              translation: { type: Type.STRING },
-            },
+              translation: { type: Type.STRING }
+            }
           },
           generalExample: {
             type: Type.OBJECT,
             properties: {
               text: { type: Type.STRING },
-              translation: { type: Type.STRING },
-            },
+              translation: { type: Type.STRING }
+            }
           },
           usageGuide: { type: Type.STRING },
         },
-        required: [
-          'word',
-          'pronunciation',
-          'partOfSpeech',
-          'definition',
-          'takarazukaExample',
-          'generalExample',
-          'usageGuide',
-        ],
-      },
-    },
+        required: ["word", "pronunciation", "partOfSpeech", "definition", "takarazukaExample", "generalExample", "usageGuide"]
+      }
+    }
   });
 
-  if (response.text) return JSON.parse(response.text) as SearchResult;
-  throw new Error('解析失败');
+  if (response.text) {
+    return JSON.parse(response.text) as SearchResult;
+  }
+  throw new Error("Failed to parse dictionary response");
 };
 
-export const generateSpeech = async (
-  text: string,
-  voiceName: string = 'Puck'
-): Promise<AudioBuffer> => {
+export const generateSpeech = async (text: string, voiceName: string = 'Puck'): Promise<AudioBuffer> => {
   const cacheKey = `${voiceName}:${text}`;
-  if (audioCache.has(cacheKey)) return audioCache.get(cacheKey)!;
+  
+  if (audioCache.has(cacheKey)) {
+    return audioCache.get(cacheKey)!;
+  }
 
   const fetchPromise = (async () => {
+    // Pronunciation / Audio-Only Replacements
+    // The text displayed on screen remains Kanji, but we send Hiragana/Phonetic to the audio engine.
     let processedText = text;
-    // 日语读音修正：强制把“天海祐希”读作“Amami Yuki”而不是“Tenkai”
-    if (/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/.test(text)) {
-      if (processedText.includes('天海祐希')) {
-        if (!/天海祐希(さん|様|ちゃん|くん)/.test(processedText)) {
-          processedText = processedText.replace(
-            /天海祐希/g,
-            'あまみゆうきさん'
-          );
-        } else {
-          processedText = processedText.replace(/天海祐希/g, 'あまみゆうき');
+    
+    // JAPANESE SPECIFIC FIXES
+    // We assume Japanese context if the text contains Kanji/Kana AND specifically matches our Amami patterns.
+    const hasJapaneseChars = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/.test(text);
+    
+    if (hasJapaneseChars) {
+        // 1. Specific fix for "天海祐希" -> "あまみゆうき"
+        // Check if honorifics exist, if not, add "san" for politeness in audio
+        if (processedText.includes("天海祐希")) {
+           if (!/天海祐希(さん|様|ちゃん|くん)/.test(processedText)) {
+               processedText = processedText.replace(/天海祐希/g, "あまみゆうきさん");
+           } else {
+               processedText = processedText.replace(/天海祐希/g, "あまみゆうき");
+           }
         }
-      }
-      processedText = processedText.replace(/天海(?!祐)/g, 'あまみ');
+        
+        // 2. Fix for "天海" (Surname alone) -> "あまみ" (Prevent 'Tenkai')
+        processedText = processedText.replace(/天海(?!祐)/g, "あまみ");
     }
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash-preview-tts',
+      model: "gemini-2.5-flash-preview-tts",
       contents: [{ parts: [{ text: processedText }] }],
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } },
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: voiceName },
+          },
         },
       },
     });
 
-    const base64Audio =
-      response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!base64Audio) throw new Error('No audio');
-    return await decodeAudioData(decode(base64Audio), getAudioContext());
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!base64Audio) throw new Error("No audio data received");
+
+    const ctx = getAudioContext();
+    return await decodeAudioData(decode(base64Audio), ctx);
   })();
 
   audioCache.set(cacheKey, fetchPromise);
-  fetchPromise.catch(() => audioCache.delete(cacheKey));
+  
+  fetchPromise.catch((e) => {
+    console.error("Audio generation failed", e);
+    audioCache.delete(cacheKey);
+  });
+
   return fetchPromise;
 };
 
 export const playAudioBuffer = async (buffer: AudioBuffer) => {
   const ctx = getAudioContext();
-  if (ctx.state === 'suspended') await ctx.resume();
+  
+  if (ctx.state === 'suspended') {
+    await ctx.resume();
+  }
+
   const source = ctx.createBufferSource();
   source.buffer = buffer;
   source.connect(ctx.destination);
@@ -174,29 +207,42 @@ export const playAudioBuffer = async (buffer: AudioBuffer) => {
 };
 
 export const chatWithGemini = async (
-  history: any[],
-  msg: string,
-  word: string
-) => {
+  history: { role: 'user'|'model', text: string }[], 
+  currentMessage: string,
+  contextWord: string
+): Promise<string> => {
+  const systemInstruction = `
+    Context: User is learning "${contextWord}".
+    Persona: Friendly study buddy.
+    Topic: Help explain nuances, culture, or answer questions about the word.
+    Keep it short.
+  `;
+  
   const chat = ai.chats.create({
     model: 'gemini-2.5-flash',
-    config: { systemInstruction: `Explain "${word}" to the user.` },
-    history: history.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
+    config: { systemInstruction },
+    history: history.map(h => ({
+      role: h.role,
+      parts: [{ text: h.text }]
+    }))
   });
-  const res = await chat.sendMessage({ message: msg });
-  return res.text || '';
+
+  const result = await chat.sendMessage({ message: currentMessage });
+  return result.text || "";
 };
 
-export const generateStory = async (
-  words: NotebookItem[],
-  nativeLang: string
-) => {
-  const prompt = `Write a short story in ${nativeLang} about Amami Yuki using these words: ${words
-    .map((w) => w.word)
-    .join(', ')}.`;
-  const res = await ai.models.generateContent({
+export const generateStory = async (words: NotebookItem[], nativeLang: string): Promise<string> => {
+  const wordList = words.map(w => w.word).join(", ");
+  const prompt = `
+    Write a short story in ${nativeLang} featuring Amami Yuki-san.
+    Include these words: ${wordList}.
+    Keep it under 200 words.
+  `;
+
+  const response = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
     contents: prompt,
   });
-  return res.text || '';
+
+  return response.text || "Could not generate story.";
 };
